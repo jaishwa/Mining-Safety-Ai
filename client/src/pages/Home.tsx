@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { clientSimulation, type SimulationAction } from "@/lib/clientSimulation";
 import {
   Activity,
   AlertOctagon,
@@ -350,7 +351,12 @@ function SettingsPage({ data, onControl }: { data: Snapshot; onControl: (action:
 }
 
 function useSafetySnapshot() {
-  return trpc.safety.snapshot.useQuery(undefined, { refetchInterval: 1000, staleTime: 500 });
+  return trpc.safety.snapshot.useQuery(undefined, {
+    refetchInterval: 1000,
+    staleTime: 500,
+    retry: 1,
+    retryDelay: 1000,
+  });
 }
 
 type Snapshot = NonNullable<ReturnType<typeof useSafetySnapshot>["data"]>;
@@ -358,15 +364,55 @@ type Snapshot = NonNullable<ReturnType<typeof useSafetySnapshot>["data"]>;
 export default function Home() {
   const [view, setView] = useState<View>("dashboard");
   const [mobileNav, setMobileNav] = useState(false);
+  const [localFallback, setLocalFallback] = useState<Snapshot | null>(null);
+
   const query = useSafetySnapshot();
   const controlMutation = trpc.safety.control.useMutation();
   const ackMutation = trpc.safety.acknowledge.useMutation();
   const utils = trpc.useUtils();
-  const data = query.data as Snapshot | undefined;
 
-  const onControl = (action: "start" | "pause" | "reset" | "step") => controlMutation.mutate({ action }, { onSuccess: result => utils.safety.snapshot.setData(undefined, result) });
-  const onAcknowledge = (alertId: string) => ackMutation.mutate({ alertId }, { onSuccess: () => utils.safety.snapshot.invalidate() });
-  if (query.isLoading || !data) return <div className="loading-screen"><div className="loading-mark"><ShieldCheck size={26} /></div><span>INITIALIZING SAFETY INTELLIGENCE</span><i /></div>;
+  // If backend tRPC API is unreachable (e.g. on pure static hosting), seamlessly run client simulation
+  useEffect(() => {
+    if (query.isError || (!query.data && !query.isLoading)) {
+      setLocalFallback(clientSimulation.snapshot() as Snapshot);
+      const timer = setInterval(() => {
+        setLocalFallback(clientSimulation.snapshot() as Snapshot);
+      }, 1000);
+      return () => clearInterval(timer);
+    }
+  }, [query.isError, query.data, query.isLoading]);
+
+  // Safety timeout: if loading takes longer than 2.5s, immediately unlock with client simulation
+  useEffect(() => {
+    if (!query.data && !localFallback) {
+      const timeout = setTimeout(() => {
+        setLocalFallback(clientSimulation.snapshot() as Snapshot);
+      }, 2500);
+      return () => clearTimeout(timeout);
+    }
+  }, [query.data, localFallback]);
+
+  const data = (query.data ?? localFallback) as Snapshot | undefined;
+
+  const onControl = (action: "start" | "pause" | "reset" | "step") => {
+    if (query.data) {
+      controlMutation.mutate({ action }, { onSuccess: result => utils.safety.snapshot.setData(undefined, result) });
+    } else {
+      const res = clientSimulation.control(action as SimulationAction);
+      setLocalFallback(res as Snapshot);
+    }
+  };
+
+  const onAcknowledge = (alertId: string) => {
+    if (query.data) {
+      ackMutation.mutate({ alertId }, { onSuccess: () => utils.safety.snapshot.invalidate() });
+    } else {
+      clientSimulation.acknowledge(alertId);
+      setLocalFallback(clientSimulation.snapshot() as Snapshot);
+    }
+  };
+
+  if (!data) return <div className="loading-screen"><div className="loading-mark"><ShieldCheck size={26} /></div><span>INITIALIZING SAFETY INTELLIGENCE</span><i /></div>;
 
   const page = view === "dashboard" ? <Dashboard data={data} setView={setView} onAcknowledge={onAcknowledge} /> : view === "live" ? <LivePage data={data} /> : view === "risk" ? <RiskPage data={data} onAcknowledge={onAcknowledge} /> : view === "map" ? <MapPage data={data} /> : view === "near-misses" ? <NearMissPage data={data} /> : view === "vehicles" ? <VehiclesPage data={data} /> : view === "analytics" ? <AnalyticsPage data={data} /> : <SettingsPage data={data} onControl={onControl} />;
 
